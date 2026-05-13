@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Bot Validador DIGI v14 — Anti-Ban / 1500 scan + 1h rest / KeepAlive / LiveMessage
+// Bot Validador DIGI + Vodafone v15 — Anti-Ban / 1500 scan + 1h rest / KeepAlive / LiveMessage
 "use strict";
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
@@ -32,7 +32,10 @@ const CYCLE_REST_MS = 60 * 60 * 1000; // 1 hora exacta
 const KEEPALIVE_DURING_REST_MS = 25000; // ping cada 25s durante descanso
 
 // ── PREFIJOS DIGI ──
-const PREFIJOS = ["34614", "34624", "34641", "34642", "34643"];
+const PREFIJOS_DIGI = ["34614", "34624", "34641", "34642", "34643"];
+
+// ── PREFIJOS VODAFONE ──
+const PREFIJOS_VODAFONE = ["34600", "34603", "34607", "34610", "34617", "34627", "34634", "34637", "34647", "34661", "34662", "34663", "34664", "34666", "34667", "34670", "34671", "34672", "34673", "34674", "34677", "34678", "34687", "34697", "34711", "34727"];
 
 // ── ACCESO RESTRINGIDO ──
 const ALLOWED_USERNAME = "K11000K";
@@ -52,6 +55,7 @@ const val = {
     on: false, stop: false,
     scanned: 0, valid: 0, skip: 0, err: 0, errRow: 0,
     start: null, chat: null, lastN: 0, lastErr: "", mode: "leads",
+    operator: "digi",  // "digi" | "vodafone" | "ambos"
     batchCount: 0, cycleScanned: 0, cycleNum: 1,
     currentFile: null
 };
@@ -80,6 +84,28 @@ const fmtTime = ms => { if (!ms || ms < 0) return "—"; const s = Math.floor(ms
 const randDelay = () => DELAY_MIN + Math.floor(Math.random() * (DELAY_MAX - DELAY_MIN));
 const randRest  = () => REST_MS_MIN + Math.floor(Math.random() * (REST_MS_MAX - REST_MS_MIN));
 const pct = (a, b) => b > 0 ? ((a / b) * 100).toFixed(1) : "0.0";
+
+// ── HELPER OPERADOR ──
+function getOperatorLabel(op) {
+    const o = op || val.operator;
+    if (o === "vodafone") return "Vodafone 🔴";
+    if (o === "ambos")    return "DIGI + Vodafone 🟣🔴";
+    return "DIGI 🟣";
+}
+
+function getOperatorPrefixes(op) {
+    const o = op || val.operator;
+    if (o === "vodafone") return PREFIJOS_VODAFONE;
+    if (o === "ambos")    return [...PREFIJOS_DIGI, ...PREFIJOS_VODAFONE];
+    return PREFIJOS_DIGI;
+}
+
+function getOperatorPrefixStr(op) {
+    const o = op || val.operator;
+    if (o === "vodafone") return "600, 603, 607, 610, 617, 627, 634, 637, 647, 661-664, 666-667, 670-674, 677-678, 687, 697, 711, 727";
+    if (o === "ambos")    return "614, 624, 641-643 (DIGI) · 600, 603, 607… (Voda)";
+    return "614, 624, 641, 642, 643";
+}
 
 // ── LIVE SEND: siempre edita el mismo mensaje ──
 async function live(chat, txt, ex = {}) {
@@ -121,10 +147,17 @@ const kb = {
         return { reply_markup: { inline_keyboard: rows } };
     },
     cancel: () => ({ inline_keyboard: [[{ text: "❌ Cancelar", callback_data: "cancel_qr" }]] }),
+    // ── NUEVO: selección de operador ──
+    operator: () => ({ reply_markup: { inline_keyboard: [
+        [{ text: "🟣 DIGI", callback_data: "op_digi" }],
+        [{ text: "🔴 Vodafone", callback_data: "op_vodafone" }],
+        [{ text: "🟣🔴 Ambos operadores", callback_data: "op_ambos" }],
+        [{ text: "🔙 Menú", callback_data: "main" }],
+    ]}}),
     mode: () => ({ reply_markup: { inline_keyboard: [
         [{ text: "👥 Leads", callback_data: "go_leads" }],
         [{ text: "⭐ Leads dedicado", callback_data: "go_dedicados" }],
-        [{ text: "🔙 Menú", callback_data: "main" }],
+        [{ text: "🔙 Operador", callback_data: "validate" }],
     ]}}),
     running: () => ({ reply_markup: { inline_keyboard: [[{ text: "📊 Estado", callback_data: "status" }, { text: "⛔ Detener", callback_data: "stop" }]] }}),
     done: () => ({ reply_markup: { inline_keyboard: [
@@ -134,9 +167,10 @@ const kb = {
     ]}})
 };
 
-// ── GENERAR NÚMERO DIGI ──
+// ── GENERAR NÚMERO (según operador activo) ──
 function genNum() {
-    const pfx = PREFIJOS[Math.floor(Math.random() * PREFIJOS.length)];
+    const prefijos = getOperatorPrefixes(val.operator);
+    const pfx = prefijos[Math.floor(Math.random() * prefijos.length)];
     const suf = String(Math.floor(Math.random() * 1e6)).padStart(6, "0");
     return pfx + suf;
 }
@@ -339,28 +373,21 @@ async function getName(num) {
 }
 
 // ── KEEPALIVE DURANTE DESCANSO ──
-// Mantiene la conexión WA viva enviando presencia periódicamente
 async function keepAliveDuringRest(durationMs) {
     const end = Date.now() + durationMs;
-    const startRest = Date.now();
 
     while (Date.now() < end && !val.stop) {
-        // Enviar presencia para mantener la conexión viva
         if (sock && connected) {
-            try {
-                await sock.sendPresenceUpdate("available");
-            } catch (_) {
-                // Si falla, no pasa nada, el keepAliveIntervalMs interno también ayuda
-            }
+            try { await sock.sendPresenceUpdate("available"); } catch (_) {}
         }
 
-        // Actualizar mensaje de Telegram cada 60s con cuenta atrás
         const remaining = end - Date.now();
         if (remaining > 0 && val.chat) {
+            const opLabel = getOperatorLabel();
             const modeLabel = val.mode === "dedicados" ? "⭐ Leads dedicado" : "👥 Leads";
             await live(val.chat,
                 `😴 *Descanso — Ciclo ${val.cycleNum} completado*\n` +
-                `${modeLabel} · DIGI 🟢\n\n` +
+                `${modeLabel} · ${opLabel}\n\n` +
                 `✅ Válidos total: ${val.valid.toLocaleString()}\n` +
                 `🔍 Escaneados total: ${val.scanned.toLocaleString()}\n` +
                 `📊 Este ciclo: ${val.cycleScanned.toLocaleString()}/${MAX_PER_CYCLE}\n\n` +
@@ -371,13 +398,12 @@ async function keepAliveDuringRest(durationMs) {
             ).catch(() => {});
         }
 
-        // Esperar 30s entre pings (o menos si queda poco)
         const waitMs = Math.min(KEEPALIVE_DURING_REST_MS, end - Date.now());
         if (waitMs > 0) await sleep(waitMs);
     }
 }
 
-// ── LIVEMESSAGE: actualiza el mensaje de validación ──
+// ── LIVEMESSAGE ──
 async function updateLive(txt, markup) {
     if (!val.chat) return;
     await live(val.chat, txt, { reply_markup: markup });
@@ -395,17 +421,18 @@ async function runValidation() {
     loadChecked();
     let dcWait = 0;
 
+    const opLabel   = getOperatorLabel();
     const modeLabel = val.mode === "dedicados" ? "⭐ Leads dedicado" : "👥 Leads";
+
     await updateLive(
-        `🚀 *Validación iniciada — Ciclo ${val.cycleNum}*\n${modeLabel} · DIGI 🟢\n🔄 Escaneando ${MAX_PER_CYCLE} números por ciclo...`,
+        `🚀 *Validación iniciada — Ciclo ${val.cycleNum}*\n${modeLabel} · ${opLabel}\n🔄 Escaneando ${MAX_PER_CYCLE} números por ciclo...`,
         kb.running().reply_markup
     );
 
     try {
         while (!val.stop) {
-            // ── CONTROL DE CICLO: 1500 escaneados → descanso 1h ──
+            // ── CICLO ──
             if (val.cycleScanned >= MAX_PER_CYCLE) {
-                // Enviar presencia "unavailable" antes de descansar
                 if (sock && connected) {
                     try { await sock.sendPresenceUpdate("unavailable"); } catch (_) {}
                 }
@@ -418,24 +445,21 @@ async function runValidation() {
                     kb.running().reply_markup
                 );
 
-                // Descanso con keepalive
                 await keepAliveDuringRest(CYCLE_REST_MS);
 
                 if (val.stop) break;
 
-                // Nuevo ciclo
                 val.cycleNum++;
                 val.cycleScanned = 0;
                 val.batchCount = 0;
                 val.errRow = 0;
 
-                // Reactivar presencia
                 if (sock && connected) {
                     try { await sock.sendPresenceUpdate("available"); } catch (_) {}
                 }
 
                 await updateLive(
-                    `🚀 *Ciclo ${val.cycleNum} iniciado*\n${modeLabel} · DIGI 🟢\n` +
+                    `🚀 *Ciclo ${val.cycleNum} iniciado*\n${modeLabel} · ${opLabel}\n` +
                     `✅ Válidos acumulados: ${val.valid.toLocaleString()}\n` +
                     `🔍 Escaneados acumulados: ${val.scanned.toLocaleString()}\n` +
                     `🔄 Escaneando ${MAX_PER_CYCLE} números más...`,
@@ -481,7 +505,6 @@ async function runValidation() {
 
             if (val.stop) break;
 
-            // Calcular cuántos números faltan en este ciclo
             const remaining = MAX_PER_CYCLE - val.cycleScanned;
             const thisBatch = Math.min(BATCH, remaining);
 
@@ -497,11 +520,10 @@ async function runValidation() {
             const res = await checkNums(batch);
             val.batchCount++;
 
-            let scannedThisBatch = 0;
             for (let i = 0; i < batch.length; i++) {
                 if (val.stop) break;
                 if (res[i] === null) { val.err++; val.errRow++; continue; }
-                val.scanned++; val.cycleScanned++; scannedThisBatch++; val.errRow = 0;
+                val.scanned++; val.cycleScanned++; val.errRow = 0;
                 if (res[i]) {
                     let name = null;
                     try { name = await timeout(getName(batch[i]), 8000, null); } catch (_) {}
@@ -512,11 +534,10 @@ async function runValidation() {
                 }
             }
 
-            // Actualizar live cada lote
             const el2 = Date.now() - val.start;
             const spd2 = el2 > 0 ? (val.scanned / (el2 / 1000)).toFixed(2) : "0";
             await updateLive(
-                `🔄 *Validando — Ciclo ${val.cycleNum}*\n${modeLabel} · DIGI 🟢\n` +
+                `🔄 *Validando — Ciclo ${val.cycleNum}*\n${modeLabel} · ${opLabel}\n` +
                 `✅ Válidos: ${val.valid.toLocaleString()}\n` +
                 `🔍 Escaneados: ${val.scanned.toLocaleString()}\n` +
                 (val.skip ? `⏭️ Sin nombre: ${val.skip.toLocaleString()}\n` : "") +
@@ -534,13 +555,13 @@ async function runValidation() {
     }
 
     val.on = false;
-    const el = Date.now() - val.start;
+    const el   = Date.now() - val.start;
     const rate = pct(val.valid, val.scanned);
 
     if (val.valid > 0 && val.currentFile && fs.existsSync(val.currentFile)) {
         live(val.chat,
             `⛔ *Validación finalizada*\n` +
-            `${val.mode === "dedicados" ? "⭐ Leads dedicado" : "👥 Leads"} · DIGI 🟢\n` +
+            `${val.mode === "dedicados" ? "⭐ Leads dedicado" : "👥 Leads"} · ${getOperatorLabel()}\n` +
             `✅ Válidos: ${val.valid.toLocaleString()}\n` +
             `🔍 Escaneados: ${val.scanned.toLocaleString()}\n` +
             (val.skip ? `⏭️ Sin nombre: ${val.skip.toLocaleString()}\n` : "") +
@@ -602,6 +623,7 @@ function finalizarLista(chat, nombre) {
     val.currentFile = null;
     let count = 0;
     try { count = fs.readFileSync(finalPath, "utf-8").split("\n").filter(l => l.trim()).length; } catch (_) {}
+    const opLabel = getOperatorLabel();
     live(chat,
         `✅ *Lista guardada correctamente*\n` +
         `📄 Archivo: *${safe}.txt*\n` +
@@ -610,7 +632,10 @@ function finalizarLista(chat, nombre) {
         kb.done()
     );
     try {
-        bot.sendDocument(chat, finalPath, { caption: `📄 *${safe}* — ${count.toLocaleString()} números DIGI`, parse_mode: "Markdown" }).catch(() => {});
+        bot.sendDocument(chat, finalPath, {
+            caption: `📄 *${safe}* — ${count.toLocaleString()} números ${opLabel}`,
+            parse_mode: "Markdown"
+        }).catch(() => {});
     } catch (_) {}
 }
 
@@ -624,17 +649,18 @@ function startVal(chat, mode) {
 // ── ESTADO ──
 function sendStatus(chat) {
     if (!val.on) { live(chat, "ℹ️ *No hay validaciones en progreso*", kb.main()); return; }
-    const el  = val.start ? Date.now() - val.start : 0;
-    const spd = el > 0 ? (val.scanned / (el / 1000)).toFixed(2) : "0";
+    const el   = val.start ? Date.now() - val.start : 0;
+    const spd  = el > 0 ? (val.scanned / (el / 1000)).toFixed(2) : "0";
     const rate = pct(val.valid, val.scanned);
+    const opLabel   = getOperatorLabel();
     const modeLabel = val.mode === "dedicados" ? "⭐ Leads dedicado" : "👥 Leads";
     live(chat,
         `📊 *Estado de validación*\n` +
-        `${modeLabel} · DIGI 🟢\n` +
+        `${modeLabel} · ${opLabel}\n` +
         `✅ Válidos: ${val.valid.toLocaleString()}\n` +
         `🔍 Escaneados: ${val.scanned.toLocaleString()}\n` +
         (val.skip ? `⏭️ Sin nombre: ${val.skip.toLocaleString()}\n` : "") +
-        (val.err ? `❌ Errores: ${val.err.toLocaleString()}\n` : "") +
+        (val.err  ? `❌ Errores: ${val.err.toLocaleString()}\n` : "") +
         `📈 Acierto: ${rate}%\n` +
         `⚡ Velocidad: ${spd}/s\n` +
         `🛡️ Ciclo ${val.cycleNum}: ${val.cycleScanned}/${MAX_PER_CYCLE}\n` +
@@ -667,7 +693,7 @@ bot.on("callback_query", async q => {
     if (q.from?.username !== ALLOWED_USERNAME) { live(chat, "🚫 Acceso denegado a leads bot"); return; }
 
     if (d === "main") {
-        live(chat, `🤖 *DIGI Validator v14*\n📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}\n🛡️ ${MAX_PER_CYCLE} escaneos/ciclo + 1h descanso`, kb.main());
+        live(chat, `🤖 *Validator v15*\n📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}\n🛡️ ${MAX_PER_CYCLE} escaneos/ciclo + 1h descanso`, kb.main());
         return;
     }
 
@@ -688,16 +714,40 @@ bot.on("callback_query", async q => {
         return;
     }
 
+    // ── PASO 1: selección de operador ──
     if (d === "validate") {
         if (!connected) { live(chat, "❌ *WhatsApp no vinculado*\nPulsa 📱 *Conectar* primero.", kb.main()); return; }
         if (val.on) { live(chat, "⚠️ *Validación en curso*", kb.running()); return; }
-        live(chat, "🎯 *Selecciona el modo de validación:*\n👥 *Leads* — Todos los números válidos\n⭐ *Leads dedicado* — Solo números con nombre", kb.mode());
+        live(chat,
+            "📡 *Selecciona el operador a validar:*\n\n" +
+            "🟣 *DIGI* — prefijos 614, 624, 641, 642, 643\n" +
+            "🔴 *Vodafone* — prefijos 600, 603, 607, 610, 617, 627…\n" +
+            "🟣🔴 *Ambos* — mezcla aleatoria de los dos",
+            kb.operator()
+        );
         return;
     }
 
-    if (d === "go_leads") { startVal(chat, "leads"); return; }
+    // ── PASO 2: selección de modo (llega tras elegir operador) ──
+    if (d === "op_digi") {
+        val.operator = "digi";
+        live(chat, "🟣 *DIGI seleccionado*\n\n🎯 Elige el modo de validación:\n👥 *Leads* — Todos los números válidos\n⭐ *Leads dedicado* — Solo números con nombre", kb.mode());
+        return;
+    }
+    if (d === "op_vodafone") {
+        val.operator = "vodafone";
+        live(chat, "🔴 *Vodafone seleccionado*\n\n🎯 Elige el modo de validación:\n👥 *Leads* — Todos los números válidos\n⭐ *Leads dedicado* — Solo números con nombre", kb.mode());
+        return;
+    }
+    if (d === "op_ambos") {
+        val.operator = "ambos";
+        live(chat, "🟣🔴 *DIGI + Vodafone seleccionado*\n\n🎯 Elige el modo de validación:\n👥 *Leads* — Todos los números válidos\n⭐ *Leads dedicado* — Solo números con nombre", kb.mode());
+        return;
+    }
+
+    if (d === "go_leads")     { startVal(chat, "leads");     return; }
     if (d === "go_dedicados") { startVal(chat, "dedicados"); return; }
-    if (d === "status") { sendStatus(chat); return; }
+    if (d === "status")  { sendStatus(chat); return; }
 
     if (d === "stop") {
         if (!val.on) { live(chat, "ℹ️ *No hay validaciones en progreso*", kb.main()); return; }
@@ -714,7 +764,7 @@ bot.on("callback_query", async q => {
         if (!fs.existsSync(filePath)) { live(chat, "❌ *Lista no encontrada*"); return; }
         try {
             const count = fs.readFileSync(filePath, "utf-8").split("\n").filter(l => l.trim()).length;
-            await bot.sendDocument(chat, filePath, { caption: `📄 *${name}* — ${count.toLocaleString()} números DIGI`, parse_mode: "Markdown" });
+            await bot.sendDocument(chat, filePath, { caption: `📄 *${name}* — ${count.toLocaleString()} números`, parse_mode: "Markdown" });
         } catch (e) { live(chat, `❌ \`${e.message}\``); }
         return;
     }
@@ -734,9 +784,10 @@ bot.on("callback_query", async q => {
 bot.onText(/\/start/, m => {
     if (!isAllowed(m)) { live(m.chat.id, "🚫 Acceso denegado a leads bot"); return; }
     live(m.chat.id,
-        `🤖 *DIGI Validator v14*\n` +
+        `🤖 *Validator v15 — DIGI + Vodafone*\n` +
         `📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}\n` +
-        `📡 Prefijos: 614, 624, 641, 642, 643\n` +
+        `📡 DIGI: 614, 624, 641, 642, 643\n` +
+        `📡 Vodafone: 600, 603, 607, 610, 617, 627, 634…\n` +
         `🛡️ Anti-ban · ${MAX_PER_CYCLE} escaneos/ciclo + 1h descanso\n` +
         `🔄 Modo continuo hasta detener`,
         kb.main()
@@ -759,7 +810,13 @@ bot.onText(/\/validar/, m => {
     const c = m.chat.id;
     if (!connected) { live(c, "❌ *WhatsApp no vinculado*\nPulsa 📱 *Conectar* primero.", kb.main()); return; }
     if (val.on) { live(c, "⚠️ *Validación en curso*", kb.running()); return; }
-    live(c, "🎯 *Selecciona el modo de validación:*\n👥 *Leads* — Todos los números válidos\n⭐ *Leads dedicado* — Solo números con nombre", kb.mode());
+    live(c,
+        "📡 *Selecciona el operador a validar:*\n\n" +
+        "🟣 *DIGI* — prefijos 614, 624, 641, 642, 643\n" +
+        "🔴 *Vodafone* — prefijos 600, 603, 607, 610, 617, 627…\n" +
+        "🟣🔴 *Ambos* — mezcla aleatoria de los dos",
+        kb.operator()
+    );
 });
 
 bot.onText(/\/estado/,      m => { if (!isAllowed(m)) { live(m.chat.id, "🚫 Acceso denegado a leads bot"); return; } sendStatus(m.chat.id); });
@@ -803,7 +860,7 @@ process.on("unhandledRejection", r  => console.error("[FATAL]", r));
 
 // ── MAIN ──
 async function main() {
-    console.log("═══ DIGI Validator v14 — 1500/ciclo + 1h descanso + KeepAlive ═══");
+    console.log("═══ Validator v15 — DIGI + Vodafone / 1500 ciclo + 1h descanso + KeepAlive ═══");
     const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
     if (has) { console.log("Reconectando..."); connectWA(null).catch(() => { connecting = false; }); }
     else console.log("Sin sesión. Esperando /conectar...");
