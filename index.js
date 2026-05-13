@@ -289,6 +289,9 @@ async function connectWA(chat) {
             clearTimeout(qrTimer); qrTimer = null;
             const ph = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
             const txt = `✅ *WhatsApp vinculado correctamente*\n📱 Cuenta: +${ph}\n🟢 Sistema listo para validar`;
+            // Resetear liveMsgId para que el siguiente live() envíe mensaje nuevo visible
+            // (sin esto, live() edita un mensaje viejo y los botones de operador no se ven)
+            liveMsgId = null; liveMsgChat = null;
             if (chat && qrMsgId) { editCaption(chat, qrMsgId, txt, kb.main().reply_markup); qrMsgId = null; }
             else if (chat) live(chat, txt, kb.main());
             qrStart = null;
